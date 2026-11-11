@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="HoloFold">
+<title>HoloFold</title>
+<style>
+  :root { --hue: 185; --ink: hsl(var(--hue) 100% 78%); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none;
+    font: 500 11px/1.2 ui-monospace, Menlo, monospace; text-transform: uppercase; letter-spacing: .08em; color: #dff; user-select: none; -webkit-user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; touch-action: none; }
+  video { display: none; }
+
+  .bar { position: fixed; left: 0; right: 0; bottom: calc(10px + env(safe-area-inset-bottom));
+    display: flex; justify-content: center; gap: 8px; padding: 0 12px; }
+  button { font: inherit; color: #cfe; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14);
+    border-radius: 999px; padding: 8px 14px; letter-spacing: .02em; }
+  button.on { color: #001a1c; background: var(--ink); border-color: transparent; }
+  button.rec { color: #fff; background: #d43a2f; border-color: transparent; }
+
+  .panel { position: fixed; left: 50%; bottom: calc(58px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+    width: min(340px, 92vw); padding: 14px 16px; border-radius: 16px; display: none;
+    background: rgba(8,14,16,.88); border: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  .panel.open { display: block; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .row label { width: 78px; opacity: .7; }
+  .row input[type=range] { flex: 1; accent-color: var(--ink); }
+  .seg { display: flex; gap: 6px; flex: 1; }
+  .seg button { flex: 1; padding: 7px 0; }
+
+  #start { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 28px;
+    background: radial-gradient(circle at 50% 60%, #06222a, #000 70%); }
+  #start h1 { margin: 0 0 8px; font-size: 26px; font-weight: 600; letter-spacing: .04em; color: var(--ink); }
+  #start p { margin: 6px auto; max-width: 300px; font-size: 14px; line-height: 1.45; opacity: .75; font-weight: 400; }
+  #start button { margin-top: 18px; font-size: 15px; padding: 12px 28px; }
+  #toast { position: fixed; top: calc(14px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+    padding: 8px 14px; border-radius: 999px; background: rgba(0,0,0,.7); border: 1px solid rgba(255,255,255,.15);
+    opacity: 0; transition: opacity .3s; pointer-events: none; max-width: 90vw; text-align: center; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="stage"></canvas>
+
+<div class="bar" id="bar">
+  <button id="bTable" class="on">Table</button>
+  <button id="bLibrary">Library</button>
+  <button id="bRecord">Record</button>
+  <button id="bHold">Hold</button>
+  <button id="bSetup">Setup</button>
+</div>
+
+<div class="panel" id="setup">
+  <div class="row"><label>Camera</label>
+    <div class="seg" id="camSeg">
+      <button data-cam="environment" class="on">Rear</button>
+      <button data-cam="user">Front</button>
+      <button data-cam="off">Off</button>
+    </div></div>
+  <div class="row"><label>Fold line</label><input id="sFold" type="range" min="0.3" max="0.7" step="0.005" value="0.5"></div>
+  <div class="row"><label>Eye height</label><input id="sEye" type="range" min="1" max="3" step="0.05" value="1.6"></div>
+  <div class="row"><label>Size</label><input id="sSize" type="range" min="0.25" max="0.6" step="0.01" value="0.45"></div>
+  <div class="row"><label>Colour</label><input id="sHue" type="range" min="0" max="360" step="1" value="185"></div>
+</div>
+
+<div class="panel" id="clip">
+  <div class="row" style="justify-content:space-between"><span>Clip ready</span>
+    <span><button id="bShare" class="on">Share</button> <button id="bDismiss">Close</button></span></div>
+</div>
+
+<div id="start">
+  <div>
+    <h1>HOLOFOLD</h1>
+    <p>Fold your phone to 90°, rest the bottom half flat on a table, and look from slightly above.</p>
+    <p>The top half shows the camera so the screen looks see-through. Drag to spin.</p>
+    <button id="bStart" class="on">Start</button>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+
+/* ---------- State ---------- */
+const state = {
+  table: true, hold: false, modelIndex: 0, facing: 'environment',
+  fold: 0.5, eye: 1.6, size: 0.45, hue: 185,
+  angle: 0, spin: 0.5, // radians, radians/sec
+  bootAt: Infinity,    // seconds; set when Start is tapped
+};
+const $ = id => document.getElementById(id);
+const canvas = $('stage'), ctx = canvas.getContext('2d'), video = $('cam');
+
+function toast(msg, ms = 2600) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+/* ---------- Models: lists of line segments in unit space (y up, footprint radius ~1) ---------- */
+const TAU = Math.PI * 2;
+
+function polyline(points, closed = false) {
+  const segs = [];
+  for (let i = 0; i < points.length - 1; i++) segs.push([points[i], points[i + 1]]);
+  if (closed) segs.push([points[points.length - 1], points[0]]);
+  return segs;
+}
+
+function tower(x, z, w, h) {
+  const r = w / 2, segs = [];
+  const corners = [[x - r, z - r], [x + r, z - r], [x + r, z + r], [x - r, z + r]];
+  for (const [cx, cz] of corners) segs.push([[cx, 0, cz], [cx, h, cz]]);
+  for (let y = 0; y <= h + 1e-6; y += h / Math.max(2, Math.round(h / 0.22)))
+    segs.push(...polyline(corners.map(([cx, cz]) => [cx, y, cz]), true));
+  return segs;
+}
+
+const MODELS = [
+  { name: 'City', build() {
+      const towers = [[0, 0, .3, 1.8], [.38, .1, .24, 1.25], [-.36, .16, .26, 1.45], [.1, -.4, .24, 1.0],
+        [-.2, -.38, .2, .75], [.45, -.32, .2, .6], [-.55, -.2, .2, .5], [.12, .45, .22, .85],
+        [-.3, .52, .18, .45], [.6, .4, .18, .4], [-.68, .25, .16, .65], [.7, 0, .16, .8]];
+      const segs = towers.flatMap(t => tower(...t));
+      segs.push([[0, 1.8, 0], [0, 2.1, 0]]); // spire
+      return segs;
+  } },
+  { name: 'Helix', build() {
+      const a = [], b = [], segs = [], n = 90;
+      for (let i = 0; i <= n; i++) {
+        const t = i / n, th = t * TAU * 2.5, y = 0.1 + t * 1.8;
+        a.push([Math.cos(th) * .45, y, Math.sin(th) * .45]);
+        b.push([-Math.cos(th) * .45, y, -Math.sin(th) * .45]);
+        if (i % 5 === 0) segs.push([a[i], b[i]]);
+      }
+      return segs.concat(polyline(a), polyline(b));
+  } },
+  { name: 'Globe', build() {
+      const segs = [], r = .8, cy = 1.0, n = 36;
+      const pt = (lat, lon) => [r * Math.cos(lat) * Math.cos(lon), cy + r * Math.sin(lat), r * Math.cos(lat) * Math.sin(lon)];
+      for (let k = -2; k <= 2; k++)
+        segs.push(...polyline(Array.from({ length: n }, (_, i) => pt(k * Math.PI / 6, i / n * TAU)), true));
+      for (let m = 0; m < 8; m++)
+        segs.push(...polyline(Array.from({ length: n + 1 }, (_, i) => pt(-Math.PI / 2 + i / n * Math.PI, m / 8 * TAU))));
+      return segs;
+  } },
+  { name: 'Crystal', build() {
+      const segs = [];
+      for (const [r, top, mid, bot] of [[.6, 1.9, 1.0, .15], [.3, 1.5, 1.0, .5]]) {
+        const ring = Array.from({ length: 6 }, (_, i) => [Math.cos(i / 6 * TAU) * r, mid, Math.sin(i / 6 * TAU) * r]);
+        segs.push(...polyline(ring, true));
+        for (const p of ring) segs.push([[0, top, 0], p], [[0, bot, 0], p]);
+      }
+      return segs;
+  } },
+];
+
+/* Split every segment into short pieces so lines bend correctly where they cross the fold. */
+function tessellate(segs, maxLen = 0.12) {
+  const out = [];
+  for (const [a, b] of segs) {
+    const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / maxLen));
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      out.push(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, i === 0 ? 0 : 1);
+    }
+  }
+  return new Float32Array(out); // x, y, z, penDown
+}
+MODELS.forEach(m => { m.verts = tessellate(m.build()); });
+
+const particles = Array.from({ length: 70 }, () => ({
+  a: Math.random() * TAU, r: Math.sqrt(Math.random()) * .9, y: Math.random() * 2, v: .25 + Math.random() * .6,
+}));
+
+/* ---------- Geometry: anamorphic projection onto a folded screen ----------
+   World: fold line is the x axis. The upright half is the wall (z = 0, y up); the flat half is the
+   floor (y = 0, z toward the viewer). A 3D point is drawn where the line from the eye through that
+   point lands on the wall or floor, so the object looks solid from the eye position. */
+const view = { w: 0, h: 0, dpr: 1, foldY: 0, H: 0, cx: 0, S: 0, zc: 0, ex: 0, ey: 0, ez: 0 };
+
+function layout() {
+  view.dpr = Math.min(window.devicePixelRatio || 1, 2);
+  view.w = canvas.width = Math.round(innerWidth * view.dpr);
+  view.h = canvas.height = Math.round(innerHeight * view.dpr);
+  view.foldY = view.h * state.fold;
+  view.H = Math.min(view.foldY, view.h - view.foldY);
+  view.cx = view.w / 2;
+  view.S = Math.min(view.H, view.w / 2) * state.size;
+  view.zc = view.H * 0.5;
+  view.ey = view.H * state.eye;
+  view.ez = view.H * 2.6;
+}
+
+const out = [0, 0];
+function project(x, y, z) {
+  const { ex, ey, ez, cx, foldY } = view;
+  const tw = z / (ez - z), yw = y + tw * (y - ey);
+  if (yw >= 0) { out[0] = cx + x + tw * (x - ex); out[1] = foldY - yw; }
+  else { const tf = y / (ey - y); out[0] = cx + x + tf * (x - ex); out[1] = foldY + z + tf * (z - ez); }
+  return out;
+}
+
+/* ---------- Rendering ---------- */
+function drawCover(src, dx, dy, dw, dh) {
+  const sw = src.videoWidth, sh = src.videoHeight;
+  if (!sw || !sh) return false;
+  const scale = Math.max(dw / sw, dh / sh), cw = dw / scale, ch = dh / scale;
+  ctx.drawImage(src, (sw - cw) / 2, (sh - ch) / 2, cw, ch, dx, dy, dw, dh);
+  return true;
+}
+
+function drawBackground() {
+  const { w, h, foldY } = view;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#05090b'; ctx.fillRect(0, 0, w, h);
+  // Table mode: camera fills only the upright half, the flat half becomes the dark projection pad.
+  if (state.table) drawCover(video, 0, 0, w, foldY); else drawCover(video, 0, 0, w, h);
+  if (state.table) {
+    const g = ctx.createLinearGradient(0, foldY, 0, h);
+    g.addColorStop(0, 'rgba(0,0,0,.82)'); g.addColorStop(1, 'rgba(0,0,0,.96)');
+    ctx.fillStyle = g; ctx.fillRect(0, foldY, w, h - foldY);
+  }
+}
+
+function drawPad(time) {
+  const { w, h, foldY, cx, zc, S, dpr } = view, hue = state.hue, cy = foldY + zc, R = Math.min(S * .95, zc * .8);
+  ctx.globalCompositeOperation = 'lighter';
+  if (state.table) { // floor grid
+    ctx.strokeStyle = `hsla(${hue},80%,70%,.10)`; ctx.lineWidth = dpr; ctx.beginPath();
+    const step = view.H / 8;
+    for (let x = cx % step; x < w; x += step) { ctx.moveTo(x, foldY); ctx.lineTo(x, h); }
+    for (let y = foldY; y < h; y += step) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+    ctx.stroke();
+  }
+  const glow = ctx.createRadialGradient(cx, cy, R * .2, cx, cy, R * 1.25);
+  glow.addColorStop(0, `hsla(${hue},100%,70%,.30)`); glow.addColorStop(.75, `hsla(${hue},100%,60%,.10)`);
+  glow.addColorStop(1, 'transparent');
+  ctx.fillStyle = glow; ctx.fillRect(cx - R * 1.3, cy - R * 1.3, R * 2.6, R * 2.6);
+  // Concentric HUD rings: [radius factor, line width, dash pattern (in R), spin speed, alpha]
+  const rings = [[1, 6, [], 0, .22], [1, 2, [], 0, .95], [1.12, 5, [.5, .12], .25, .45], [.9, 3, [.04, .04], -.5, .6],
+    [.7, 1.5, [.9, .2], .8, .55], [.5, 4, [.3, .5], -.35, .3], [1.18, 1, [.02, .1], -.15, .55]];
+  for (const [k, lw, dash, speed, a] of rings) {
+    ctx.setLineDash(dash.map(d => d * R)); ctx.lineDashOffset = -time * speed * R;
+    ctx.strokeStyle = `hsla(${hue},100%,78%,${a})`; ctx.lineWidth = lw * dpr;
+    ctx.beginPath(); ctx.arc(cx, cy, R * k, 0, TAU); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.fillStyle = `hsla(${hue},100%,85%,.9)`;
+  for (let i = 0; i < 36; i++) {
+    const a = i / 36 * TAU + time * .3;
+    ctx.fillRect(cx + Math.cos(a) * R * .9 - dpr, cy + Math.sin(a) * R * .9 - dpr, 2 * dpr, 2 * dpr);
+  }
+}
+
+function drawHologram(time, dt) {
+  const { S, zc, dpr } = view, hue = state.hue, verts = MODELS[state.modelIndex].verts;
+  const cos = Math.cos(state.angle), sin = Math.sin(state.angle);
+  const flicker = .82 + .18 * Math.sin(time * 37) * Math.sin(time * 5.3);
+  const g = Math.min(1, Math.max(0, (time - state.bootAt - 1.4) / 1.2)), grow = g * g * (3 - 2 * g); // rises after boot
+
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (let i = 0; i < verts.length; i += 4) {
+    const x = verts[i], z = verts[i + 2];
+    const p = project((x * cos + z * sin) * S, verts[i + 1] * S * grow, zc + (z * cos - x * sin) * S);
+    if (verts[i + 3]) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]);
+  }
+  ctx.strokeStyle = `hsla(${hue},100%,65%,${.16 * flicker})`; ctx.lineWidth = 5 * dpr; ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},100%,85%,${.85 * flicker})`; ctx.lineWidth = 1.2 * dpr; ctx.stroke();
+
+  // Scanner ring sweeping up and down through the model.
+  const ringR = Math.min(S * 1.1, zc * .95), ringY = scanLevel(time) * 2 * S * grow;
+  ctx.beginPath();
+  for (let i = 0; i <= 48; i++) {
+    const a = i / 48 * TAU, p = project(Math.cos(a) * ringR, ringY, zc + Math.sin(a) * ringR);
+    if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]);
+  }
+  ctx.strokeStyle = `hsla(${hue},100%,70%,.25)`; ctx.lineWidth = 6 * dpr; ctx.stroke();
+  ctx.strokeStyle = `hsla(${hue},100%,90%,.9)`; ctx.lineWidth = 1.5 * dpr; ctx.stroke();
+
+  ctx.fillStyle = `hsla(${hue},100%,88%,.8)`;
+  for (const q of particles) {
+    q.y += q.v * dt; if (q.y > 2.1) q.y = 0;
+    const p = project(Math.cos(q.a) * q.r * S, q.y * S, zc + Math.sin(q.a) * q.r * S);
+    const s = (1 - q.y / 2.1) * 2.2 * dpr;
+    ctx.fillRect(p[0] - s / 2, p[1] - s / 2, s, s);
+  }
+}
+
+const scanLevel = time => .5 + .45 * Math.sin(time * .9); // 0..1 height of the scanner ring
+const BOOT_LINES = ['INITIALIZING PROJECTION MATRIX', 'CALIBRATING FOLD GEOMETRY', 'SYSTEMS ONLINE'];
+
+/* Heads-up display on the upright half: corner brackets, telemetry, boot sequence. */
+function drawHud(time) {
+  const boot = time - state.bootAt;
+  if (!(boot >= 0)) return;
+  const { w, foldY, dpr } = view, hue = state.hue, m = 14 * dpr, top = m * 3, L = 22 * dpr, lh = 14 * dpr;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = `hsla(${hue},100%,75%,.7)`; ctx.lineWidth = 1.5 * dpr; ctx.beginPath();
+  for (const [x, y, sx, sy] of [[m, top, 1, 1], [w - m, top, -1, 1], [m, foldY - m, 1, -1], [w - m, foldY - m, -1, -1]]) {
+    ctx.moveTo(x + sx * L, y); ctx.lineTo(x, y); ctx.lineTo(x, y + sy * L);
+  }
+  ctx.stroke();
+
+  const model = MODELS[state.modelIndex], deg = ((state.angle * 180 / Math.PI) % 360 + 360) % 360;
+  const cam = { environment: 'REAR', user: 'FRONT', off: 'OFFLINE' }[state.facing];
+  const left = [`PROJECTION // ${model.name.toUpperCase()}`, `ROT ${deg.toFixed(1).padStart(5, '0')}°`,
+    `SCAN ${Math.round(scanLevel(time) * 100).toString().padStart(3, '0')}%`, state.hold ? 'HOLD' : 'TRACKING'];
+  const right = [new Date().toLocaleTimeString('en-GB'), `CAM ${cam}`, `NODES ${model.verts.length / 4}`];
+  ctx.font = `${10 * dpr}px ui-monospace, Menlo, monospace`;
+  ctx.fillStyle = `hsla(${hue},100%,82%,.85)`;
+  ctx.textAlign = 'left'; left.forEach((s, i) => ctx.fillText(s, m + 8 * dpr, top + lh * (i + 1.2)));
+  ctx.textAlign = 'right'; right.forEach((s, i) => ctx.fillText(s, w - m - 8 * dpr, top + lh * (i + 1.2)));
+
+  if (boot < 3) { // typed boot sequence
+    ctx.textAlign = 'center'; ctx.font = `${12 * dpr}px ui-monospace, Menlo, monospace`;
+    let chars = Math.floor(boot * 45);
+    BOOT_LINES.forEach((s, i) => {
+      if (chars > 0) ctx.fillText(s.slice(0, chars), w / 2, foldY * .45 + i * lh * 1.4);
+      chars -= s.length;
+    });
+  }
+}
+
+let last = 0;
+function frame(ms) {
+  const time = ms / 1000, dt = Math.min(.05, time - last); last = time;
+  if (!state.hold && !drag.active) state.angle += state.spin * dt;
+  drawBackground(); drawPad(time); drawHologram(time, dt); drawHud(time);
+  requestAnimationFrame(frame);
+}
+
+/* ---------- Camera ---------- */
+let stream = null;
+function stopCamera() { stream?.getTracks().forEach(t => t.stop()); stream = null; video.srcObject = null; }
+
+async function startCamera(facing) {
+  stopCamera();
+  state.facing = facing;
+  if (facing === 'off') return;
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera needs an https:// link');
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false, video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function selectCamera(facing) {
+  try { await startCamera(facing); }
+  catch (err) { state.facing = 'off'; toast(err.name === 'NotAllowedError' ? 'Camera permission denied' : err.message); }
+  document.querySelectorAll('#camSeg button').forEach(b => b.classList.toggle('on', b.dataset.cam === state.facing));
+}
+
+/* ---------- Recording (canvas already contains camera + hologram) ---------- */
+const recorder = { rec: null, chunks: [], file: null };
+
+function toggleRecord() {
+  if (recorder.rec) { recorder.rec.stop(); return; }
+  if (!window.MediaRecorder || !canvas.captureStream) { toast('Recording is not supported in this browser'); return; }
+  const mime = ['video/mp4', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
+  const rec = new MediaRecorder(canvas.captureStream(30), mime ? { mimeType: mime } : undefined);
+  recorder.chunks = [];
+  rec.ondataavailable = e => e.data.size && recorder.chunks.push(e.data);
+  rec.onstop = () => {
+    const type = rec.mimeType || 'video/mp4', ext = type.includes('webm') ? 'webm' : 'mp4';
+    recorder.file = new File(recorder.chunks, `holofold.${ext}`, { type });
+    recorder.rec = null;
+    $('bRecord').classList.remove('rec'); $('bRecord').textContent = 'Record';
+    $('clip').classList.add('open');
+  };
+  rec.start(); recorder.rec = rec;
+  $('bRecord').classList.add('rec'); $('bRecord').textContent = 'Stop';
+}
+
+async function shareClip() {
+  const file = recorder.file; if (!file) return;
+  try {
+    if (navigator.canShare?.({ files: [file] })) await navigator.share({ files: [file], title: 'HoloFold' });
+    else { const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = file.name; a.click(); }
+  } catch (err) { if (err.name !== 'AbortError') toast('Could not share the clip'); }
+}
+
+/* ---------- Input ---------- */
+const drag = { active: false, x: 0 };
+canvas.addEventListener('pointerdown', e => { drag.active = true; drag.x = e.clientX; closePanels(); });
+canvas.addEventListener('pointermove', e => {
+  if (!drag.active) return;
+  state.angle += (e.clientX - drag.x) * 0.012; drag.x = e.clientX;
+});
+for (const type of ['pointerup', 'pointercancel']) canvas.addEventListener(type, () => { drag.active = false; });
+
+function closePanels() { $('setup').classList.remove('open'); $('bSetup').classList.remove('on'); }
+
+$('bTable').onclick = e => { state.table = !state.table; e.target.classList.toggle('on', state.table); };
+$('bLibrary').onclick = () => { state.modelIndex = (state.modelIndex + 1) % MODELS.length; toast(MODELS[state.modelIndex].name, 900); };
+$('bRecord').onclick = toggleRecord;
+$('bHold').onclick = e => { state.hold = !state.hold; e.target.classList.toggle('on', state.hold); };
+$('bSetup').onclick = e => { e.target.classList.toggle('on', $('setup').classList.toggle('open')); };
+$('bShare').onclick = shareClip;
+$('bDismiss').onclick = () => $('clip').classList.remove('open');
+$('camSeg').onclick = e => { if (e.target.dataset.cam) selectCamera(e.target.dataset.cam); };
+
+const sliders = { sFold: 'fold', sEye: 'eye', sSize: 'size', sHue: 'hue' };
+for (const [id, key] of Object.entries(sliders)) $(id).oninput = e => {
+  state[key] = +e.target.value;
+  if (key === 'hue') document.documentElement.style.setProperty('--hue', state.hue);
+  layout();
+};
+
+addEventListener('resize', layout);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopCamera(); else if ($('start').hidden && state.facing !== 'off') selectCamera(state.facing);
+});
+
+$('bStart').onclick = async () => {
+  $('start').hidden = true; $('start').style.display = 'none';
+  state.bootAt = performance.now() / 1000;
+  try { // spoken confirmation; silently skipped where speech is unavailable
+    speechSynthesis.speak(Object.assign(new SpeechSynthesisUtterance('Projection systems online.'), { rate: .95, pitch: .8 }));
+  } catch {}
+  await selectCamera('environment');
+};
+
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
